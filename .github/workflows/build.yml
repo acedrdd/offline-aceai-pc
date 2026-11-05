@@ -1,0 +1,98 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Validate dependencies
+        run: pip check
+      - name: Syntax check
+        run: python -m compileall -q app.py
+      - name: Backend tests
+        run: pytest -q
+      - name: Frontend sanity check
+        run: test -f index.html
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        run: |
+          mkdir dist
+          zip dist/aceai.zip app.py launcher.py index.html requirements.txt requirements-dev.txt requirements-llm.txt README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aceai
+          path: dist/aceai.zip
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies (prebuilt CPU llama.cpp wheel)
+        run: |
+          pip install -r requirements.txt pyinstaller
+          pip install llama-cpp-python --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+      - name: Build AceAI.exe
+        run: >
+          pyinstaller --onefile --name AceAI
+          --add-data "index.html;."
+          --collect-all llama_cpp
+          launcher.py
+      - name: Smoke test (server starts and answers)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\AceAI.exe -PassThru
+          $ok = $false
+          foreach ($i in 1..60) {
+            try { if ((Invoke-RestMethod http://127.0.0.1:8000/api/health).status -eq "ok") { $ok = $true; break } } catch {}
+            Start-Sleep 2
+          }
+          Stop-Process -Id $p.Id -Force
+          if (-not $ok) { throw "AceAI.exe did not start" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AceAI-windows
+          path: dist/AceAI.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, windows-exe]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aceai
+      - uses: actions/download-artifact@v4
+        with:
+          name: AceAI-windows
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aceai.zip
+            AceAI.exe
